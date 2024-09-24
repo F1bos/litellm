@@ -3221,3 +3221,89 @@ async def test_key_list_unsupported_params(prisma_client):
         error_str = str(e.message)
         assert "Unsupported parameter" in error_str
         pass
+
+
+@pytest.mark.asyncio
+async def test_auth_vertex_ai_route(prisma_client):
+    """
+    If user is premium user and vertex-ai route is used. Assert Virtual Key checks are run
+    """
+    litellm.set_verbose = True
+    setattr(litellm.proxy.proxy_server, "prisma_client", prisma_client)
+    setattr(litellm.proxy.proxy_server, "premium_user", True)
+    setattr(litellm.proxy.proxy_server, "master_key", "sk-1234")
+    await litellm.proxy.proxy_server.prisma_client.connect()
+
+    route = "/vertex-ai/publishers/google/models/gemini-1.5-flash-001:generateContent"
+    request = Request(scope={"type": "http"})
+    request._url = URL(url=route)
+    request._headers = {"Authorization": "Bearer sk-12345"}
+    try:
+        await user_api_key_auth(request=request, api_key="Bearer " + "sk-12345")
+        pytest.fail("Expected this call to fail. User is over limit.")
+    except Exception as e:
+        print(vars(e))
+        print("error str=", str(e.message))
+        error_str = str(e.message)
+        assert e.code == "401"
+        assert "Invalid proxy server token passed" in error_str
+
+        pass
+
+
+@pytest.mark.asyncio
+async def test_service_accounts(prisma_client):
+    """
+    Do not delete
+    this is the Admin UI flow
+    """
+    # Make a call to a key with model = `all-proxy-models` this is an Alias from LiteLLM Admin UI
+    setattr(litellm.proxy.proxy_server, "prisma_client", prisma_client)
+    setattr(litellm.proxy.proxy_server, "master_key", "sk-1234")
+    setattr(
+        litellm.proxy.proxy_server,
+        "general_settings",
+        {"service_account_settings": {"enforced_params": ["user"]}},
+    )
+
+    await litellm.proxy.proxy_server.prisma_client.connect()
+
+    request = GenerateKeyRequest(
+        metadata={"service_account_id": f"prod-service-{uuid.uuid4()}"},
+    )
+    response = await generate_key_fn(
+        data=request,
+    )
+
+    print("key generated=", response)
+    generated_key = response.key
+    bearer_token = "Bearer " + generated_key
+    # make a bad /chat/completions call expect it to fail
+
+    request = Request(scope={"type": "http"})
+    request._url = URL(url="/chat/completions")
+
+    async def return_body():
+        return b'{"model": "gemini-pro-vision"}'
+
+    request.body = return_body
+
+    # use generated key to auth in
+    print("Bearer token being sent to user_api_key_auth() - {}".format(bearer_token))
+    try:
+        result = await user_api_key_auth(request=request, api_key=bearer_token)
+        pytest.fail("Expected this call to fail. Bad request using service account")
+    except Exception as e:
+        print("error str=", str(e.message))
+        assert "This is a required param for service account" in str(e.message)
+
+    # make a good /chat/completions call it should pass
+    async def good_return_body():
+        return b'{"model": "gemini-pro-vision", "user": "foo"}'
+
+    request.body = good_return_body
+
+    result = await user_api_key_auth(request=request, api_key=bearer_token)
+    print("response from user_api_key_auth", result)
+
+    setattr(litellm.proxy.proxy_server, "general_settings", {})
