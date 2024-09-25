@@ -103,25 +103,6 @@ class MistralEmbeddingConfig:
         return optional_params
 
 
-class AzureAIStudioConfig:
-    def get_required_params(self) -> List[ProviderField]:
-        """For a given provider, return it's required fields with a description"""
-        return [
-            ProviderField(
-                field_name="api_key",
-                field_type="string",
-                field_description="Your Azure AI Studio API Key.",
-                field_value="zEJ...",
-            ),
-            ProviderField(
-                field_name="api_base",
-                field_type="string",
-                field_description="Your Azure AI Studio API Base.",
-                field_value="https://Mistral-serverless.",
-            ),
-        ]
-
-
 class DeepInfraConfig:
     """
     Reference: https://deepinfra.com/docs/advanced/openai_api
@@ -704,7 +685,6 @@ class OpenAIChatCompletion(BaseLLM):
         drop_params: Optional[bool] = None,
     ):
         super().completion()
-        exception_mapping_worked = False
         try:
             if headers:
                 optional_params["extra_headers"] = headers
@@ -911,6 +891,9 @@ class OpenAIChatCompletion(BaseLLM):
             status_code = getattr(e, "status_code", 500)
             error_headers = getattr(e, "headers", None)
             error_text = getattr(e, "text", str(e))
+            error_response = getattr(e, "response", None)
+            if error_headers is None and error_response:
+                error_headers = getattr(error_response, "headers", None)
             raise OpenAIError(
                 status_code=status_code, message=error_text, headers=error_headers
             )
@@ -1003,8 +986,12 @@ class OpenAIChatCompletion(BaseLLM):
                     raise e
                 # e.message
             except Exception as e:
+                exception_response = getattr(e, "response", None)
                 status_code = getattr(e, "status_code", 500)
                 error_headers = getattr(e, "headers", None)
+                if error_headers is None and exception_response:
+                    error_headers = getattr(exception_response, "headers", None)
+
                 raise OpenAIError(
                     status_code=status_code, message=str(e), headers=error_headers
                 )
@@ -1144,10 +1131,13 @@ class OpenAIChatCompletion(BaseLLM):
                     raise e
 
                 error_headers = getattr(e, "headers", None)
+                status_code = getattr(e, "status_code", 500)
+                error_response = getattr(e, "response", None)
+                if error_headers is None and error_response:
+                    error_headers = getattr(error_response, "headers", None)
                 if response is not None and hasattr(response, "text"):
-                    error_headers = getattr(e, "headers", None)
                     raise OpenAIError(
-                        status_code=500,
+                        status_code=status_code,
                         message=f"{str(e)}\n\nOriginal Response: {response.text}",  # type: ignore
                         headers=error_headers,
                     )
@@ -1272,8 +1262,12 @@ class OpenAIChatCompletion(BaseLLM):
             )
             status_code = getattr(e, "status_code", 500)
             error_headers = getattr(e, "headers", None)
+            error_text = getattr(e, "text", str(e))
+            error_response = getattr(e, "response", None)
+            if error_headers is None and error_response:
+                error_headers = getattr(error_response, "headers", None)
             raise OpenAIError(
-                status_code=status_code, message=str(e), headers=error_headers
+                status_code=status_code, message=error_text, headers=error_headers
             )
 
     def embedding(  # type: ignore
@@ -1352,8 +1346,12 @@ class OpenAIChatCompletion(BaseLLM):
         except Exception as e:
             status_code = getattr(e, "status_code", 500)
             error_headers = getattr(e, "headers", None)
+            error_text = getattr(e, "text", str(e))
+            error_response = getattr(e, "response", None)
+            if error_headers is None and error_response:
+                error_headers = getattr(error_response, "headers", None)
             raise OpenAIError(
-                status_code=status_code, message=str(e), headers=error_headers
+                status_code=status_code, message=error_text, headers=error_headers
             )
 
     async def aimage_generation(
@@ -1774,7 +1772,15 @@ class OpenAITextCompletion(BaseLLM):
                 ## RESPONSE OBJECT
                 return TextCompletionResponse(**response_json)
         except Exception as e:
-            raise e
+            status_code = getattr(e, "status_code", 500)
+            error_headers = getattr(e, "headers", None)
+            error_text = getattr(e, "text", str(e))
+            error_response = getattr(e, "response", None)
+            if error_headers is None and error_response:
+                error_headers = getattr(error_response, "headers", None)
+            raise OpenAIError(
+                status_code=status_code, message=error_text, headers=error_headers
+            )
 
     async def acompletion(
         self,
@@ -1825,7 +1831,15 @@ class OpenAITextCompletion(BaseLLM):
             response_obj._hidden_params.original_response = json.dumps(response_json)
             return response_obj
         except Exception as e:
-            raise e
+            status_code = getattr(e, "status_code", 500)
+            error_headers = getattr(e, "headers", None)
+            error_text = getattr(e, "text", str(e))
+            error_response = getattr(e, "response", None)
+            if error_headers is None and error_response:
+                error_headers = getattr(error_response, "headers", None)
+            raise OpenAIError(
+                status_code=status_code, message=error_text, headers=error_headers
+            )
 
     def streaming(
         self,
@@ -1860,8 +1874,12 @@ class OpenAITextCompletion(BaseLLM):
         except Exception as e:
             status_code = getattr(e, "status_code", 500)
             error_headers = getattr(e, "headers", None)
+            error_text = getattr(e, "text", str(e))
+            error_response = getattr(e, "response", None)
+            if error_headers is None and error_response:
+                error_headers = getattr(error_response, "headers", None)
             raise OpenAIError(
-                status_code=status_code, message=str(e), headers=error_headers
+                status_code=status_code, message=error_text, headers=error_headers
             )
         streamwrapper = CustomStreamWrapper(
             completion_stream=response,
@@ -1871,8 +1889,19 @@ class OpenAITextCompletion(BaseLLM):
             stream_options=data.get("stream_options", None),
         )
 
-        for chunk in streamwrapper:
-            yield chunk
+        try:
+            for chunk in streamwrapper:
+                yield chunk
+        except Exception as e:
+            status_code = getattr(e, "status_code", 500)
+            error_headers = getattr(e, "headers", None)
+            error_text = getattr(e, "text", str(e))
+            error_response = getattr(e, "response", None)
+            if error_headers is None and error_response:
+                error_headers = getattr(error_response, "headers", None)
+            raise OpenAIError(
+                status_code=status_code, message=error_text, headers=error_headers
+            )
 
     async def async_streaming(
         self,
@@ -1910,8 +1939,19 @@ class OpenAITextCompletion(BaseLLM):
             stream_options=data.get("stream_options", None),
         )
 
-        async for transformed_chunk in streamwrapper:
-            yield transformed_chunk
+        try:
+            async for transformed_chunk in streamwrapper:
+                yield transformed_chunk
+        except Exception as e:
+            status_code = getattr(e, "status_code", 500)
+            error_headers = getattr(e, "headers", None)
+            error_text = getattr(e, "text", str(e))
+            error_response = getattr(e, "response", None)
+            if error_headers is None and error_response:
+                error_headers = getattr(error_response, "headers", None)
+            raise OpenAIError(
+                status_code=status_code, message=error_text, headers=error_headers
+            )
 
 
 class OpenAIFilesAPI(BaseLLM):

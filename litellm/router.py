@@ -154,6 +154,7 @@ class Router:
         client_ttl: int = 3600,  # ttl for cached clients - will re-initialize after this time in seconds
         ## SCHEDULER ##
         polling_interval: Optional[float] = None,
+        default_priority: Optional[int] = None,
         ## RELIABILITY ##
         num_retries: Optional[int] = None,
         timeout: Optional[float] = None,
@@ -220,6 +221,7 @@ class Router:
             caching_groups (Optional[List[tuple]]): List of model groups for caching across model groups. Defaults to None.
             client_ttl (int): Time-to-live for cached clients in seconds. Defaults to 3600.
             polling_interval: (Optional[float]): frequency of polling queue. Only for '.scheduler_acompletion()'. Default is 3ms.
+            default_priority: (Optional[int]): the default priority for a request. Only for '.scheduler_acompletion()'. Default is None.
             num_retries (Optional[int]): Number of retries for failed requests. Defaults to 2.
             timeout (Optional[float]): Timeout for requests. Defaults to None.
             default_litellm_params (dict): Default parameters for Router.chat.completion.create. Defaults to {}.
@@ -336,6 +338,7 @@ class Router:
         self.scheduler = Scheduler(
             polling_interval=polling_interval, redis_cache=redis_cache
         )
+        self.default_priority = default_priority
         self.default_deployment = None  # use this to track the users default deployment, when they want to use model = *
         self.default_max_parallel_requests = default_max_parallel_requests
         self.provider_default_deployments: Dict[str, List] = {}
@@ -712,12 +715,11 @@ class Router:
             kwargs["original_function"] = self._acompletion
             kwargs["num_retries"] = kwargs.get("num_retries", self.num_retries)
 
-            timeout = kwargs.get("request_timeout", self.timeout)
             kwargs.setdefault("metadata", {}).update({"model_group": model})
 
-            if kwargs.get("priority", None) is not None and isinstance(
-                kwargs.get("priority"), int
-            ):
+            request_priority = kwargs.get("priority") or self.default_priority
+
+            if request_priority is not None and isinstance(request_priority, int):
                 response = await self.schedule_acompletion(**kwargs)
             else:
                 response = await self.async_function_with_fallbacks(**kwargs)
@@ -3085,9 +3087,9 @@ class Router:
         except Exception as e:
             current_attempt = None
             original_exception = e
+
             """
             Retry Logic
-             
             """
             _healthy_deployments, _all_deployments = (
                 await self._async_get_healthy_deployments(
@@ -3105,16 +3107,6 @@ class Router:
                 content_policy_fallbacks=content_policy_fallbacks,
             )
 
-            # decides how long to sleep before retry
-            _timeout = self._time_to_sleep_before_retry(
-                e=original_exception,
-                remaining_retries=num_retries,
-                num_retries=num_retries,
-                healthy_deployments=_healthy_deployments,
-            )
-            # sleeps for the length of the timeout
-            await asyncio.sleep(_timeout)
-
             if (
                 self.retry_policy is not None
                 or self.model_group_retry_policy is not None
@@ -3128,11 +3120,19 @@ class Router:
             ## LOGGING
             if num_retries > 0:
                 kwargs = self.log_retry(kwargs=kwargs, e=original_exception)
+            else:
+                raise
 
+            # decides how long to sleep before retry
+            _timeout = self._time_to_sleep_before_retry(
+                e=original_exception,
+                remaining_retries=num_retries,
+                num_retries=num_retries,
+                healthy_deployments=_healthy_deployments,
+            )
+            # sleeps for the length of the timeout
+            await asyncio.sleep(_timeout)
             for current_attempt in range(num_retries):
-                verbose_router_logger.debug(
-                    f"retrying request. Current attempt - {current_attempt}; num retries: {num_retries}"
-                )
                 try:
                     # if the function call is successful, no exception will be raised and we'll break out of the loop
                     response = await original_function(*args, **kwargs)
@@ -3370,14 +3370,14 @@ class Router:
         if (
             healthy_deployments is not None
             and isinstance(healthy_deployments, list)
-            and len(healthy_deployments) > 0
+            and len(healthy_deployments) > 1
         ):
             return 0
 
         response_headers: Optional[httpx.Headers] = None
         if hasattr(e, "response") and hasattr(e.response, "headers"):  # type: ignore
             response_headers = e.response.headers  # type: ignore
-        elif hasattr(e, "litellm_response_headers"):
+        if hasattr(e, "litellm_response_headers"):
             response_headers = e.litellm_response_headers  # type: ignore
 
         if response_headers is not None:
@@ -3561,7 +3561,7 @@ class Router:
 
         except Exception as e:
             verbose_router_logger.exception(
-                "litellm.proxy.hooks.prompt_injection_detection.py::async_pre_call_hook(): Exception occured - {}".format(
+                "litellm.router.Router::deployment_callback_on_success(): Exception occured - {}".format(
                     str(e)
                 )
             )
@@ -4335,157 +4335,177 @@ class Router:
 
         total_tpm: Optional[int] = None
         total_rpm: Optional[int] = None
+        configurable_clientside_auth_params: Optional[List[str]] = None
 
         for model in self.model_list:
-            if "model_name" in model and model["model_name"] == model_group:
-                # model in model group found #
-                litellm_params = LiteLLM_Params(**model["litellm_params"])
-                # get model tpm
-                _deployment_tpm: Optional[int] = None
-                if _deployment_tpm is None:
-                    _deployment_tpm = model.get("tpm", None)
-                if _deployment_tpm is None:
-                    _deployment_tpm = model.get("litellm_params", {}).get("tpm", None)
-                if _deployment_tpm is None:
-                    _deployment_tpm = model.get("model_info", {}).get("tpm", None)
+            is_match = False
+            if (
+                "model_name" in model and model["model_name"] == model_group
+            ):  # exact match
+                is_match = True
+            elif (
+                "model_name" in model
+                and model_group in self.provider_default_deployments
+            ):  # wildcard model
+                is_match = True
 
-                if _deployment_tpm is not None:
-                    if total_tpm is None:
-                        total_tpm = 0
-                    total_tpm += _deployment_tpm  # type: ignore
-                # get model rpm
-                _deployment_rpm: Optional[int] = None
-                if _deployment_rpm is None:
-                    _deployment_rpm = model.get("rpm", None)
-                if _deployment_rpm is None:
-                    _deployment_rpm = model.get("litellm_params", {}).get("rpm", None)
-                if _deployment_rpm is None:
-                    _deployment_rpm = model.get("model_info", {}).get("rpm", None)
+            if not is_match:
+                continue
+            # model in model group found #
+            litellm_params = LiteLLM_Params(**model["litellm_params"])
+            # get configurable clientside auth params
+            configurable_clientside_auth_params = (
+                litellm_params.configurable_clientside_auth_params
+            )
+            # get model tpm
+            _deployment_tpm: Optional[int] = None
+            if _deployment_tpm is None:
+                _deployment_tpm = model.get("tpm", None)
+            if _deployment_tpm is None:
+                _deployment_tpm = model.get("litellm_params", {}).get("tpm", None)
+            if _deployment_tpm is None:
+                _deployment_tpm = model.get("model_info", {}).get("tpm", None)
 
-                if _deployment_rpm is not None:
-                    if total_rpm is None:
-                        total_rpm = 0
-                    total_rpm += _deployment_rpm  # type: ignore
-                # get model info
-                try:
-                    model_info = litellm.get_model_info(model=litellm_params.model)
-                except Exception:
-                    model_info = None
-                # get llm provider
-                model, llm_provider = "", ""
-                try:
-                    model, llm_provider, _, _ = litellm.get_llm_provider(
-                        model=litellm_params.model,
-                        custom_llm_provider=litellm_params.custom_llm_provider,
+            if _deployment_tpm is not None:
+                if total_tpm is None:
+                    total_tpm = 0
+                total_tpm += _deployment_tpm  # type: ignore
+            # get model rpm
+            _deployment_rpm: Optional[int] = None
+            if _deployment_rpm is None:
+                _deployment_rpm = model.get("rpm", None)
+            if _deployment_rpm is None:
+                _deployment_rpm = model.get("litellm_params", {}).get("rpm", None)
+            if _deployment_rpm is None:
+                _deployment_rpm = model.get("model_info", {}).get("rpm", None)
+
+            if _deployment_rpm is not None:
+                if total_rpm is None:
+                    total_rpm = 0
+                total_rpm += _deployment_rpm  # type: ignore
+            # get model info
+            try:
+                model_info = litellm.get_model_info(model=litellm_params.model)
+            except Exception:
+                model_info = None
+            # get llm provider
+            model, llm_provider = "", ""
+            try:
+                model, llm_provider, _, _ = litellm.get_llm_provider(
+                    model=litellm_params.model,
+                    custom_llm_provider=litellm_params.custom_llm_provider,
+                )
+            except litellm.exceptions.BadRequestError as e:
+                verbose_router_logger.error(
+                    "litellm.router.py::get_model_group_info() - {}".format(str(e))
+                )
+
+            if model_info is None:
+                supported_openai_params = litellm.get_supported_openai_params(
+                    model=model, custom_llm_provider=llm_provider
+                )
+                if supported_openai_params is None:
+                    supported_openai_params = []
+                model_info = ModelMapInfo(
+                    key=model_group,
+                    max_tokens=None,
+                    max_input_tokens=None,
+                    max_output_tokens=None,
+                    input_cost_per_token=0,
+                    output_cost_per_token=0,
+                    litellm_provider=llm_provider,
+                    mode="chat",
+                    supported_openai_params=supported_openai_params,
+                    supports_system_messages=None,
+                )
+
+            if model_group_info is None:
+                model_group_info = ModelGroupInfo(
+                    model_group=user_facing_model_group_name, providers=[llm_provider], **model_info  # type: ignore
+                )
+            else:
+                # if max_input_tokens > curr
+                # if max_output_tokens > curr
+                # if input_cost_per_token > curr
+                # if output_cost_per_token > curr
+                # supports_parallel_function_calling == True
+                # supports_vision == True
+                # supports_function_calling == True
+                if llm_provider not in model_group_info.providers:
+                    model_group_info.providers.append(llm_provider)
+                if (
+                    model_info.get("max_input_tokens", None) is not None
+                    and model_info["max_input_tokens"] is not None
+                    and (
+                        model_group_info.max_input_tokens is None
+                        or model_info["max_input_tokens"]
+                        > model_group_info.max_input_tokens
                     )
-                except litellm.exceptions.BadRequestError as e:
-                    verbose_router_logger.error(
-                        "litellm.router.py::get_model_group_info() - {}".format(str(e))
+                ):
+                    model_group_info.max_input_tokens = model_info["max_input_tokens"]
+                if (
+                    model_info.get("max_output_tokens", None) is not None
+                    and model_info["max_output_tokens"] is not None
+                    and (
+                        model_group_info.max_output_tokens is None
+                        or model_info["max_output_tokens"]
+                        > model_group_info.max_output_tokens
                     )
+                ):
+                    model_group_info.max_output_tokens = model_info["max_output_tokens"]
+                if model_info.get("input_cost_per_token", None) is not None and (
+                    model_group_info.input_cost_per_token is None
+                    or model_info["input_cost_per_token"]
+                    > model_group_info.input_cost_per_token
+                ):
+                    model_group_info.input_cost_per_token = model_info[
+                        "input_cost_per_token"
+                    ]
+                if model_info.get("output_cost_per_token", None) is not None and (
+                    model_group_info.output_cost_per_token is None
+                    or model_info["output_cost_per_token"]
+                    > model_group_info.output_cost_per_token
+                ):
+                    model_group_info.output_cost_per_token = model_info[
+                        "output_cost_per_token"
+                    ]
+                if (
+                    model_info.get("supports_parallel_function_calling", None)
+                    is not None
+                    and model_info["supports_parallel_function_calling"] is True  # type: ignore
+                ):
+                    model_group_info.supports_parallel_function_calling = True
+                if (
+                    model_info.get("supports_vision", None) is not None
+                    and model_info["supports_vision"] is True  # type: ignore
+                ):
+                    model_group_info.supports_vision = True
+                if (
+                    model_info.get("supports_function_calling", None) is not None
+                    and model_info["supports_function_calling"] is True  # type: ignore
+                ):
+                    model_group_info.supports_function_calling = True
+                if (
+                    model_info.get("supported_openai_params", None) is not None
+                    and model_info["supported_openai_params"] is not None
+                ):
+                    model_group_info.supported_openai_params = model_info[
+                        "supported_openai_params"
+                    ]
 
-                if model_info is None:
-                    supported_openai_params = litellm.get_supported_openai_params(
-                        model=model, custom_llm_provider=llm_provider
-                    )
-                    if supported_openai_params is None:
-                        supported_openai_params = []
-                    model_info = ModelMapInfo(
-                        key=model_group,
-                        max_tokens=None,
-                        max_input_tokens=None,
-                        max_output_tokens=None,
-                        input_cost_per_token=0,
-                        output_cost_per_token=0,
-                        litellm_provider=llm_provider,
-                        mode="chat",
-                        supported_openai_params=supported_openai_params,
-                        supports_system_messages=None,
-                    )
+        if model_group_info is not None:
+            ## UPDATE WITH TOTAL TPM/RPM FOR MODEL GROUP
+            if total_tpm is not None:
+                model_group_info.tpm = total_tpm
 
-                if model_group_info is None:
-                    model_group_info = ModelGroupInfo(
-                        model_group=user_facing_model_group_name, providers=[llm_provider], **model_info  # type: ignore
-                    )
-                else:
-                    # if max_input_tokens > curr
-                    # if max_output_tokens > curr
-                    # if input_cost_per_token > curr
-                    # if output_cost_per_token > curr
-                    # supports_parallel_function_calling == True
-                    # supports_vision == True
-                    # supports_function_calling == True
-                    if llm_provider not in model_group_info.providers:
-                        model_group_info.providers.append(llm_provider)
-                    if (
-                        model_info.get("max_input_tokens", None) is not None
-                        and model_info["max_input_tokens"] is not None
-                        and (
-                            model_group_info.max_input_tokens is None
-                            or model_info["max_input_tokens"]
-                            > model_group_info.max_input_tokens
-                        )
-                    ):
-                        model_group_info.max_input_tokens = model_info[
-                            "max_input_tokens"
-                        ]
-                    if (
-                        model_info.get("max_output_tokens", None) is not None
-                        and model_info["max_output_tokens"] is not None
-                        and (
-                            model_group_info.max_output_tokens is None
-                            or model_info["max_output_tokens"]
-                            > model_group_info.max_output_tokens
-                        )
-                    ):
-                        model_group_info.max_output_tokens = model_info[
-                            "max_output_tokens"
-                        ]
-                    if model_info.get("input_cost_per_token", None) is not None and (
-                        model_group_info.input_cost_per_token is None
-                        or model_info["input_cost_per_token"]
-                        > model_group_info.input_cost_per_token
-                    ):
-                        model_group_info.input_cost_per_token = model_info[
-                            "input_cost_per_token"
-                        ]
-                    if model_info.get("output_cost_per_token", None) is not None and (
-                        model_group_info.output_cost_per_token is None
-                        or model_info["output_cost_per_token"]
-                        > model_group_info.output_cost_per_token
-                    ):
-                        model_group_info.output_cost_per_token = model_info[
-                            "output_cost_per_token"
-                        ]
-                    if (
-                        model_info.get("supports_parallel_function_calling", None)
-                        is not None
-                        and model_info["supports_parallel_function_calling"] is True  # type: ignore
-                    ):
-                        model_group_info.supports_parallel_function_calling = True
-                    if (
-                        model_info.get("supports_vision", None) is not None
-                        and model_info["supports_vision"] is True  # type: ignore
-                    ):
-                        model_group_info.supports_vision = True
-                    if (
-                        model_info.get("supports_function_calling", None) is not None
-                        and model_info["supports_function_calling"] is True  # type: ignore
-                    ):
-                        model_group_info.supports_function_calling = True
-                    if (
-                        model_info.get("supported_openai_params", None) is not None
-                        and model_info["supported_openai_params"] is not None
-                    ):
-                        model_group_info.supported_openai_params = model_info[
-                            "supported_openai_params"
-                        ]
+            if total_rpm is not None:
+                model_group_info.rpm = total_rpm
 
-        ## UPDATE WITH TOTAL TPM/RPM FOR MODEL GROUP
-        if total_tpm is not None and model_group_info is not None:
-            model_group_info.tpm = total_tpm
-
-        if total_rpm is not None and model_group_info is not None:
-            model_group_info.rpm = total_rpm
+            ## UPDATE WITH CONFIGURABLE CLIENTSIDE AUTH PARAMS FOR MODEL GROUP
+            if configurable_clientside_auth_params is not None:
+                model_group_info.configurable_clientside_auth_params = (
+                    configurable_clientside_auth_params
+                )
 
         return model_group_info
 
@@ -5324,7 +5344,6 @@ class Router:
 
             return deployment
         except Exception as e:
-
             traceback_exception = traceback.format_exc()
             # if router rejects call -> log to langfuse/otel/etc.
             if request_kwargs is not None:

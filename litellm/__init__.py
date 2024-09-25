@@ -257,7 +257,7 @@ s3_callback_params: Optional[Dict] = None
 generic_logger_headers: Optional[Dict] = None
 default_key_generate_params: Optional[Dict] = None
 upperbound_key_generate_params: Optional[LiteLLM_UpperboundKeyGenerateParams] = None
-default_user_params: Optional[Dict] = None
+default_internal_user_params: Optional[Dict] = None
 default_team_settings: Optional[List] = None
 max_user_budget: Optional[float] = None
 default_max_internal_user_budget: Optional[float] = None
@@ -963,8 +963,8 @@ from .llms.OpenAI.openai import (
     MistralEmbeddingConfig,
     DeepInfraConfig,
     GroqConfig,
-    AzureAIStudioConfig,
 )
+from .llms.azure_ai.chat.transformation import AzureAIStudioConfig
 from .llms.mistral.mistral_chat_transformation import MistralConfig
 from .llms.OpenAI.chat.o1_transformation import (
     OpenAIO1Config,
